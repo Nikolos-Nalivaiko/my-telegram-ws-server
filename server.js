@@ -14,6 +14,9 @@ const PORT = process.env.PORT || 3000;
 // Храним клиентов: clientId -> WebSocket
 const clients = new Map();
 
+// Храним контекст ответа: operatorId -> clientId
+const replyContext = new Map();
+
 ////////////////////////////////////////////////////
 // 1) Запуск WebSocket-сервера (на том же порту, что Express)
 ////////////////////////////////////////////////////
@@ -48,65 +51,94 @@ const startWebSocket = (serverInstance) => {
 const app = express();
 app.use(bodyParser.json());
 
-// Пример эндпоинта, куда Телеграм будет слать обновления
+// Эндпоинт, куда Телеграм будет слать обновления
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const update = req.body;
 
-    // Если пришёл callback_query (нажатие на inline-кнопку)
+    // Обработка callback_query (нажатие на inline-кнопку "Відповісти")
     if (update.callback_query) {
-      const cbData = update.callback_query.data; // Это наш client_id
-      const fromUser =
-        update.callback_query.from.username || update.callback_query.from.id;
+      const clientId = update.callback_query.data; // Это наш client_id
+      const operatorId = update.callback_query.from.id;
+      const chatId = update.callback_query.message.chat.id;
+
       console.log(
-        `[Telegram] Inline-кнопка нажата. clientId=${cbData}, from=${fromUser}`
+        `[Telegram] Inline-кнопка нажата. clientId=${clientId}, operatorId=${operatorId}`
       );
 
-      // Можно написать оператору или отправить подсказку.
-      // Но главное – мы знаем client_id
-      // Для примера сразу отправим в Telegram ответ:
+      // Сохраняем контекст ответа: оператор -> клиент
+      replyContext.set(operatorId, clientId);
+
+      // Отправляем оператору запрос на ввод сообщения
       await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
         {
-          chat_id: update.callback_query.message.chat.id,
-          text: `Введите ответ в формате: ${cbData}: ваш текст`,
+          chat_id: chatId,
+          text: `Введіть ваше повідомлення для клієнта ${clientId}:`,
         }
       );
 
       return res.sendStatus(200);
     }
 
-    // Если обычное сообщение
+    // Обработка обычных сообщений
     if (update.message) {
       const text = update.message.text || "";
       const chatId = update.message.chat.id;
+      const operatorId = update.message.from.id;
 
-      // Допустим, оператор отправляет ответ вида: "client_abc123: Привет!"
-      if (text.includes(":")) {
+      // Проверяем, существует ли контекст ответа для этого оператора
+      if (replyContext.has(operatorId)) {
+        const clientId = replyContext.get(operatorId);
+        const operatorReply = text.trim();
+
+        if (clients.has(clientId)) {
+          const wsClient = clients.get(clientId);
+          wsClient.send(`Оператор: ${operatorReply}`);
+
+          await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+              chat_id: chatId,
+              text: `Відповідь відправлена користувачу ${clientId} ✔️`,
+            }
+          );
+        } else {
+          await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+              chat_id: chatId,
+              text: `Користувач ${clientId} не знайдений або відключився. ❌`,
+            }
+          );
+        }
+
+        // Очищаем контекст ответа после обработки
+        replyContext.delete(operatorId);
+      } 
+      // Альтернативная обработка сообщений в формате "clientId: текст"
+      else if (text.includes(":")) {
         const [rawClientId, operatorReply] = text.split(":");
         const trimmedClientId = rawClientId.trim();
         const trimmedReply = operatorReply.trim();
 
-        // Найдём WebSocket‑подключение этого клиента
         if (clients.has(trimmedClientId)) {
           const wsClient = clients.get(trimmedClientId);
           wsClient.send(`Оператор: ${trimmedReply}`);
 
-          // Заодно отправим оператору подтверждение
           await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             {
               chat_id: chatId,
-              text: `Ответ отправлен пользователю ${trimmedClientId} ✔️`,
+              text: `Відповідь відправлена користувачу ${trimmedClientId} ✔️`,
             }
           );
         } else {
-          // Клиент не найден
           await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             {
               chat_id: chatId,
-              text: `Клиент ${trimmedClientId} не найден или отключился. ❌`,
+              text: `Користувач ${trimmedClientId} не знайдений або відключився. ❌`,
             }
           );
         }
@@ -120,9 +152,10 @@ app.post("/telegram-webhook", async (req, res) => {
   }
 });
 
-// Запускаем http-сервер
+// Запуск HTTP-сервера
 server = app.listen(PORT, () => {
   console.log(`Express server listening on port ${PORT}`);
-  // Стартуем WebSocket-сервер поверх этого же http-сервера
+  // Запуск WebSocket-сервера поверх этого же HTTP-сервера
   startWebSocket(server);
 });
+
