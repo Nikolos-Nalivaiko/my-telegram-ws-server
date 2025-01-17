@@ -1,98 +1,115 @@
+/////////////////////////////////////////////
 // server.js
+/////////////////////////////////////////////
 const express = require("express");
 const bodyParser = require("body-parser");
 const { WebSocketServer } = require("ws");
 const axios = require("axios");
 
-// Берём из переменных окружения (Railway позволит их задавать),
-// или указываем какие-то дефолты
+// Дані з оточення (Railway, Heroku), або ваші дефолтні:
 const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN ||
   "6389303268:AAEoYFk9XHYq6dMnugS7UIaSuweODcTQEm8";
+
 const PORT = process.env.PORT || 3000;
 
-// Храним клиентов: clientId -> WebSocket
+// Хранимо відкриті з’єднання: clientId -> WebSocket
 const clients = new Map();
 
-// Храним контекст ответа: operatorId -> clientId
+// Хранимо контекст відповіді: operatorId -> clientId (кому оператор зараз відповідає)
 const replyContext = new Map();
 
+// Хранимо офлайн-повідомлення: clientId -> array of messages
+// Якщо користувач офлайн, сюди додаємо його повідомлення, щоб відправити коли підключиться.
+const offlineMessages = new Map();
+
 ////////////////////////////////////////////////////
-// 1) Запуск WebSocket-сервера (на том же порту, что Express)
+// 1) Запуск WebSocket-сервера (на тому ж порту, що і Express)
 ////////////////////////////////////////////////////
-let server; // Сохраним экземпляр HTTP-сервера
+let server;
 const startWebSocket = (serverInstance) => {
-  // Инициализируем WSS, передав наш http-сервер
   const wss = new WebSocketServer({ server: serverInstance });
 
   wss.on("connection", (ws, req) => {
-    // Получим client_id из query ?client_id=xxxx
+    // Витягаємо client_id із query ?client_id=xxxx
     const params = new URLSearchParams(req.url.split("?")[1]);
     const clientId = params.get("client_id") || "unknown_client";
 
-    console.log("[WebSocket] Новый клиент:", clientId);
+    console.log("[WebSocket] Новий клієнт:", clientId);
+    // Зберігаємо підключення
     clients.set(clientId, ws);
 
+    // Якщо в offlineMessages є якісь непрочитані (нерозіслані) повідомлення 
+    // для цього clientId, одразу відправимо:
+    if (offlineMessages.has(clientId)) {
+      const messages = offlineMessages.get(clientId);
+      messages.forEach((msg) => {
+        ws.send(msg);
+      });
+      // Після успішного відправлення очищаємо
+      offlineMessages.delete(clientId);
+    }
+
     ws.on("close", () => {
-      console.log("[WebSocket] Клиент отключился:", clientId);
+      console.log("[WebSocket] Клієнт відключився:", clientId);
+      // Видаляємо з мапи відкритих підключень
       clients.delete(clientId);
     });
 
     ws.on("message", (msg) => {
-      console.log(`[WebSocket] Сообщение от ${clientId}: ${msg}`);
-      // Если нужно, можно что-то сделать с сообщением
+      console.log(`[WebSocket] Повідомлення від ${clientId}: ${msg}`);
+      // Якщо потрібно, можна тут обробити повідомлення від самого користувача
     });
   });
 };
 
 ////////////////////////////////////////////////////
-// 2) Express-приложение для принятия вебхука от Telegram
+// 2) Express-додаток для прийому вебхука від Telegram
 ////////////////////////////////////////////////////
 const app = express();
 app.use(bodyParser.json());
 
-// Эндпоинт, куда Телеграм будет слать обновления
+// Точка входу, куди Telegram слатиме оновлення
 app.post("/telegram-webhook", async (req, res) => {
   try {
     const update = req.body;
 
-    // Обработка callback_query (нажатие на inline-кнопку "Відповісти")
+    // Якщо натиснута inline-кнопка "Відповісти"
     if (update.callback_query) {
-      const clientId = update.callback_query.data; // Это наш client_id
+      const clientId = update.callback_query.data; // це наш client_id
       const operatorId = update.callback_query.from.id;
       const chatId = update.callback_query.message.chat.id;
 
       console.log(
-        `[Telegram] Inline-кнопка нажата. clientId=${clientId}, operatorId=${operatorId}`
+        `[Telegram] Inline-кнопка натиснута. clientId=${clientId}, operatorId=${operatorId}`
       );
 
-      // Сохраняем контекст ответа: оператор -> клиент
+      // Зберігаємо контекст: оператор -> clientId
       replyContext.set(operatorId, clientId);
 
-      // Отправляем оператору запрос на ввод сообщения
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          chat_id: chatId,
-          text: `Введіть ваше повідомлення для клієнта ${clientId}:`,
-        }
-      );
+      // Просимо оператора ввести повідомлення
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        chat_id: chatId,
+        text: `Введіть ваше повідомлення для клієнта ${clientId}:`,
+      });
 
       return res.sendStatus(200);
     }
 
-    // Обработка обычных сообщений
+    // Якщо звичайне повідомлення
     if (update.message) {
       const text = update.message.text || "";
       const chatId = update.message.chat.id;
       const operatorId = update.message.from.id;
 
-      // Проверяем, существует ли контекст ответа для этого оператора
+      // Якщо оператор уже натискав "Відповісти", і ми знаємо clientId
       if (replyContext.has(operatorId)) {
         const clientId = replyContext.get(operatorId);
         const operatorReply = text.trim();
 
+        // Перевіряємо, чи онлайн зараз клієнт
         if (clients.has(clientId)) {
+          // Відправляємо напряму
           const wsClient = clients.get(clientId);
           wsClient.send(`Оператор: ${operatorReply}`);
 
@@ -104,19 +121,24 @@ app.post("/telegram-webhook", async (req, res) => {
             }
           );
         } else {
+          // Якщо клієнт офлайн, зберігаємо офлайн-повідомлення
+          let stored = offlineMessages.get(clientId) || [];
+          stored.push(`Оператор: ${operatorReply}`);
+          offlineMessages.set(clientId, stored);
+
           await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             {
               chat_id: chatId,
-              text: `Користувач ${clientId} не знайдений або відключився. ❌`,
+              text: `Користувач ${clientId} зараз офлайн. Повідомлення буде доставлено, коли він знову з'явиться онлайн.`,
             }
           );
         }
 
-        // Очищаем контекст ответа после обработки
+        // Видаляємо контекст
         replyContext.delete(operatorId);
       } 
-      // Альтернативная обработка сообщений в формате "clientId: текст"
+      // Або альтернативна форма "clientId: текст"
       else if (text.includes(":")) {
         const [rawClientId, operatorReply] = text.split(":");
         const trimmedClientId = rawClientId.trim();
@@ -134,11 +156,16 @@ app.post("/telegram-webhook", async (req, res) => {
             }
           );
         } else {
+          // Зберігаємо офлайн
+          let stored = offlineMessages.get(trimmedClientId) || [];
+          stored.push(`Оператор: ${trimmedReply}`);
+          offlineMessages.set(trimmedClientId, stored);
+
           await axios.post(
             `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
             {
               chat_id: chatId,
-              text: `Користувач ${trimmedClientId} не знайдений або відключився. ❌`,
+              text: `Користувач ${trimmedClientId} наразі офлайн. Повідомлення збережено і буде доставлено пізніше.`,
             }
           );
         }
@@ -147,7 +174,7 @@ app.post("/telegram-webhook", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("[Webhook] Ошибка:", err);
+    console.error("[Webhook] Помилка:", err);
     res.sendStatus(500);
   }
 });
@@ -155,7 +182,7 @@ app.post("/telegram-webhook", async (req, res) => {
 // Запуск HTTP-сервера
 server = app.listen(PORT, () => {
   console.log(`Express server listening on port ${PORT}`);
-  // Запуск WebSocket-сервера поверх этого же HTTP-сервера
+  // Запускаємо WebSocket-сервер поверх цього ж HTTP-сервера
   startWebSocket(server);
 });
 
